@@ -1,6 +1,6 @@
 ---
 title: "FDI and Growth: Panel Evidence with Income-Group Heterogeneity"
-author: "Lorenzo Dufour, 800536386"
+author: "Lorenzo Dufour, 800536386\\thanks{Replication materials: \\href{https://github.com/dufourlorenzo/replication-fdi-growth-panel}{github.com/dufourlorenzo/replication-fdi-growth-panel}}"
 date: today
 format:
   pdf:
