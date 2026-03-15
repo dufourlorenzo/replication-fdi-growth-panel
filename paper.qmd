@@ -38,7 +38,6 @@ library(WDI)
 #| cache: true
 # Pull all three series at once from the World Bank API.
 # extra = TRUE provides the region column used to drop aggregate entries
-# (e.g. "World", "Sub-Saharan Africa") and gives the iso3c country code.
 panel_raw <- WDI(
   indicator = c(fdi    = "BX.KLT.DINV.WD.GD.ZS",
                 gdppcg = "NY.GDP.PCAP.KD.ZG",
@@ -47,6 +46,8 @@ panel_raw <- WDI(
   extra     = TRUE
 ) |>
   filter(region != "Aggregates", !is.na(iso3c), iso3c != "") |>
+  # for reproducibility, restrict to the period covered to the one available at the time of analysis
+  filter(year >= 1960, year <= 2025) |> 
   rename(code = iso3c) |>
   select(country, code, year, fdi, gdppcg, gdppc)
 

@@ -19,7 +19,12 @@ the PDF paper in one command. No pre-processed datasets are required.
 
 ```
 replication/
+├── data/                      # data for reproducability if API data changes
+  ├── API_BX.KLT.DINV.WD.GD.ZS_DS2_en_csv_v2_397.csv            # Foreign direct investment, net inflows (% of GDP)
+  ├── API_NY.GDP.PCAP.KD.ZG_DS2_en_csv_v2_94752.csv             # GDP per capita growth (annual %)
+  ├── API_NY.GDP.PCAP.PP.KD_DS2_en_csv_v2_4572.csv              # GDP per capita, PPP (constant 2021 international $)
 ├── README.md                  # this file
+├── paper.pdf                  # rendered paper
 ├── paper.qmd                  # paper source (Quarto + R)
 ├── references.bib             # bibliography (BibTeX)
 ```
