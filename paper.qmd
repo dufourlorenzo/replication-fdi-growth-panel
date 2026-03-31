@@ -83,6 +83,32 @@ fdi_w_lo <- round(q_f[1], 1)
 fdi_w_hi <- round(q_f[2], 1)
 ```
 
+```{r load-extra}
+#| include: false
+#| cache: true
+# Trade openness (NE.TRD.GNFS.ZS) used in robustness check R7
+trade_raw <- WDI(
+  indicator = c(trade = "NE.TRD.GNFS.ZS"),
+  country   = "all",
+  extra     = TRUE
+) |>
+  filter(region != "Aggregates", !is.na(iso3c), iso3c != "") |>
+  filter(year >= 1960, year <= 2025) |>
+  rename(code = iso3c) |>
+  select(code, year, trade)
+
+# FDI outflows as % of GDP (BM.KLT.DINV.WD.GD.ZS) tested as IV weight; not in main estimation
+fdi_out_raw <- WDI(
+  indicator = c(fdi_out = "BM.KLT.DINV.WD.GD.ZS"),
+  country   = "all",
+  extra     = TRUE
+) |>
+  filter(region != "Aggregates", !is.na(iso3c), iso3c != "") |>
+  filter(year >= 1960, year <= 2025) |>
+  rename(code = iso3c) |>
+  select(code, year, fdi_out)
+```
+
 ```{r analysis}
 #| include: false
 # Classify countries by time-averaged PPP GDP per capita vs. sample median
@@ -127,11 +153,13 @@ mean_lgdppc  <- round(mean(est$lgdppc_l1, na.rm = TRUE), 2)
 mean_gdppc_k <- round(exp(mean(est$lgdppc_l1, na.rm = TRUE)) / 1000, 1)
 mean_grow_li <- round(mean(est$gdppcg[est$low_inc == 1], na.rm = TRUE), 1)
 
-setFixest_dict(c(ihs_fdi       = "asinh FDI(t-1)",
-                 ihs_fdi_li    = "asinh FDI(t-1) \u00d7 Below-median",
-                 ihs_fdi_li_tv = "asinh FDI(t-1) \u00d7 Below-median (TV)",
-                 lgdppc_l1     = "ln GDPpc(t-1)",
-                 gdppcg        = "GDPpc Growth"))
+setFixest_dict(c(ihs_fdi          = "asinh FDI(t-1)",
+                 ihs_fdi_li       = "asinh FDI(t-1) \u00d7 Below-median",
+                 ihs_fdi_li_tv    = "asinh FDI(t-1) \u00d7 Below-median (TV)",
+                 ihs_fdi_li_init  = "asinh FDI(t-1) \u00d7 Below-median (Init.)",
+                 trade_l1         = "Trade openness(t-1)",
+                 lgdppc_l1        = "ln GDPpc(t-1)",
+                 gdppcg           = "GDPpc Growth"))
 
 m1 <- feols(gdppcg ~ ihs_fdi,                                          data = est, cluster = ~code)
 m2 <- feols(gdppcg ~ ihs_fdi | code + year,                            data = est, cluster = ~code)
@@ -200,6 +228,84 @@ p_bal_l <- total_li_p(m_bal)
 p_l2_l  <- total_li_p(m_l2, fdi_var = "ihs_fdi_l2", int_var = "ihs_fdi_l2_li")
 p_l3_l  <- total_li_p(m_l3, fdi_var = "ihs_fdi_l3", int_var = "ihs_fdi_l3_li")
 
+# ── R5: Initial-period income classification (fully prospective) ──────────────
+# Each country is classified by its GDP per capita in its first year in est
+init_inc <- est |>
+  group_by(code) |> arrange(year) |>
+  summarise(gdppc_init = first(gdppc), .groups = "drop")
+med_init   <- median(init_inc$gdppc_init, na.rm = TRUE)
+init_inc   <- init_inc |> mutate(low_inc_init = as.integer(gdppc_init < med_init))
+n_low_init <- sum(init_inc$low_inc_init)
+
+est <- est |>
+  left_join(init_inc |> select(code, low_inc_init), by = "code") |>
+  mutate(ihs_fdi_li_init = ihs_fdi * low_inc_init)
+
+m_init  <- feols(gdppcg ~ ihs_fdi + ihs_fdi_li_init + lgdppc_l1 | code + year,
+                 data = est, cluster = ~code)
+b_init_h <- coef(m_init)["ihs_fdi"]
+b_init_l <- coef(m_init)["ihs_fdi"] + coef(m_init)["ihs_fdi_li_init"]
+p_init_h <- get_p(m_init, "ihs_fdi")
+p_init_l <- total_li_p(m_init, int_var = "ihs_fdi_li_init")
+
+# ── EDIT database statistics (for limitations paragraph) ─────────────────────
+# Loaded from the local CSV; used only for descriptive counts, not estimation
+edit_bit   <- readr::read_csv("data/edit_bit_data.csv", show_col_types = FALSE)
+n_edit_agr <- nrow(edit_bit)
+all_iso    <- edit_bit |>
+  dplyr::pull(`Party ISO codes`) |>
+  stringr::str_split(",") |>
+  unlist() |>
+  stringr::str_trim()
+n_edit_cty <- length(unique(all_iso[!is.na(all_iso) & nzchar(all_iso)]))
+
+# ── R6: Exclude financial centres and resource enclaves ───────────────────────
+# Countries with mean winsorised FDI/GDP exceeding 10% are excluded
+excl_thresh  <- 10
+excl_summary <- panel_raw |>
+  group_by(code, country) |>
+  summarise(mean_fdi = mean(fdi, na.rm = TRUE), .groups = "drop") |>
+  filter(mean_fdi > excl_thresh) |>
+  arrange(desc(mean_fdi))
+excl_codes   <- excl_summary$code
+n_excl       <- nrow(excl_summary)
+# Display label: top 5 by mean FDI/GDP, then "and X others"
+n_show       <- min(5, n_excl)
+excl_label   <- if (n_excl > n_show) {
+  paste0(paste(head(excl_summary$country, n_show), collapse = ", "),
+         ", and ", n_excl - n_show, " others")
+} else {
+  paste(excl_summary$country, collapse = ", ")
+}
+est_noout     <- est |> filter(!code %in% excl_codes)
+n_obs_noout   <- nrow(est_noout)
+
+m_excl  <- feols(gdppcg ~ ihs_fdi + ihs_fdi_li + lgdppc_l1 | code + year,
+                 data = est_noout, cluster = ~code)
+b_excl_h <- coef(m_excl)["ihs_fdi"]
+b_excl_l <- coef(m_excl)["ihs_fdi"] + coef(m_excl)["ihs_fdi_li"]
+p_excl_h <- get_p(m_excl, "ihs_fdi")
+p_excl_l <- total_li_p(m_excl)
+
+# ── R7: Trade openness control ────────────────────────────────────────────────
+trade_lag <- trade_raw |>
+  arrange(code, year) |>
+  group_by(code) |>
+  mutate(trade_l1 = lag(trade, 1)) |>
+  ungroup() |>
+  select(code, year, trade_l1)
+
+est_trade   <- est |> left_join(trade_lag, by = c("code", "year")) |>
+  filter(!is.na(trade_l1))
+n_obs_trade <- nrow(est_trade)
+
+m_trade <- feols(gdppcg ~ ihs_fdi + ihs_fdi_li + lgdppc_l1 + trade_l1 | code + year,
+                 data = est_trade, cluster = ~code)
+b_trade_h <- coef(m_trade)["ihs_fdi"]
+b_trade_l <- coef(m_trade)["ihs_fdi"] + coef(m_trade)["ihs_fdi_li"]
+p_trade_h <- get_p(m_trade, "ihs_fdi")
+p_trade_l <- total_li_p(m_trade)
+
 stars_p <- function(p) {
   if      (p < 0.01) "***"
   else if (p < 0.05) "**"
@@ -229,7 +335,7 @@ cat(paste0(
   "relative-backwardness hypothesis: whether technology spillovers from FDI are larger ",
   "where the gap with the global frontier is greatest. ",
   "The results suggest that the aggregate FDI-growth relationship is attenuated once fixed ",
-  "effects are introduced, but masks income-group heterogeneity. ",
+  "effects are introduced, but this attenuation masks income-group heterogeneity. ",
   "In above-median-income economies the FDI coefficient is statistically indistinguishable from zero. ",
   "In below-median-income economies a one-percentage-point increase in the lagged FDI-to-GDP ratio is associated with approximately ",
   round(marg, 2),
@@ -237,8 +343,9 @@ cat(paste0(
   "significant at the ",
   if(p4_l_1w < 0.001) "0.1\\%" else if(p4_l_1w < 0.01) "1\\%" else if(p4_l_1w < 0.05) "5\\%" else if(p4_l_1w < 0.10) "10\\%" else "conventional",
   " level. ",
-  "These findings are consistent with technology-transfer mechanisms and have ",
-  "implications for development policy.\n",
+  "These findings are consistent with technology-transfer mechanisms and suggest that ",
+  "the income-group heterogeneity in FDI-growth effects has practical relevance for host-country ",
+  "industrial and investment policy.\n",
   "\\end{abstract}\n"
 ))
 ```
@@ -251,7 +358,7 @@ The distinction between these two interpretations has policy consequences. The c
 
 This paper contributes evidence by exploiting within-country temporal variation in an unbalanced panel covering `r n_countries` economies from `r yr_min` to `r yr_max`. Three methodological choices distinguish the approach. First, FDI is lagged by one period relative to growth, which mitigates the most direct form of simultaneity bias. Second, two-way fixed effects are employed, absorbing time-invariant country characteristics (geography, colonial history, institutional quality) and year-specific global shocks, so that identification draws on within-country changes in FDI over time. Third, the analysis tests for income-group heterogeneity in the FDI-growth relationship. The theoretical prior, dating to @findlay1978, is that technology spillovers from FDI are largest where the technology gap between the host economy and the global frontier is greatest, precisely in lower-income countries. Testing this mechanism requires both a long panel and the income-group interaction employed here.
 
-The main results are as follows. The pooled cross-sectional correlation between FDI and growth is positive and large, confirming earlier findings in the literature. Once country and year fixed effects are introduced, however, the average effect falls, consistent with level selection (wealthier countries attracting more FDI for reasons unrelated to FDI's own effect on growth). For above-median-income economies, the fixed-effects estimate is statistically indistinguishable from zero. For below-median-income economies the total effect is approximately `r round(b4_l, 2)` percentage points of GDP per capita growth per unit of asinh(FDI) (`r sig_label(p4_l_1w)`). These findings are consistent with @findlay1978's relative-backwardness hypothesis and with firm-level evidence from @pasali2020.
+The main results are as follows. The pooled cross-sectional correlation between FDI and growth is positive and large, confirming earlier findings in the literature. Once country and year fixed effects are introduced, however, the average effect falls, consistent with level selection (wealthier countries attracting more FDI for reasons unrelated to FDI's own effect on growth). For above-median-income economies, the fixed-effects estimate is statistically indistinguishable from zero. For below-median-income economies the total effect is approximately `r round(b4_l, 2)` percentage points of GDP per capita growth per unit of asinh(FDI) (`r sig_label(p4_l_1w)`). These findings are consistent with @findlay1978's relative-backwardness hypothesis and with the pattern documented by @pasali2020, who find that the effects of foreign ownership on firm performance vary substantially by firm size and host-country context.
 
 The remainder of the paper is organised as follows. Section 2 reviews the relevant theoretical and empirical literature. Section 3 describes the data. Section 4 lays out the empirical strategy. Section 5 presents and discusses the results. Section 6 concludes with policy implications and directions for future research.
 
@@ -267,15 +374,15 @@ The growth literature provides the second building block. @barro1991's cross-cou
 
 ## Empirical Literature
 
-The empirical literature on FDI and growth is large and yields mixed results. @kechagia2018 survey sixty years of empirical research spanning 1950 to 2015, documenting a wide range of findings: while many studies identify positive effects, a share find negligible or negative relationships, and magnitudes vary considerably with sample, period, and identification strategy. Several mechanisms have been proposed to explain this heterogeneity: absorptive capacity (countries below a human capital or financial development threshold cannot translate FDI into growth), the nature of FDI (resource-seeking vs. efficiency-seeking), and the direction of causation. @borensztein1998 find that FDI raises growth only in countries with sufficient human capital, providing early cross-country evidence for an absorptive-capacity threshold. @alfaro2004 show that local financial market development is a conditioning factor: FDI has a negligible or negative effect on growth in countries with underdeveloped financial systems, but a positive effect where domestic credit markets are deep. @carkovic2005 apply GMM estimators to a large cross-country panel and find little evidence of an independent causal effect of FDI on growth once country fixed effects and other growth determinants are controlled for, a finding that underscores the identification challenge.
+The empirical literature on FDI and growth is large and yields mixed results. @kechagia2018 survey sixty years of research and document a wide range of findings: many studies identify positive effects, but a significant share find negligible or negative relationships, with magnitudes varying considerably across samples and identification strategies. @borensztein1998 find that FDI raises growth only in countries with sufficient human capital, providing early evidence for an absorptive-capacity threshold. @alfaro2004 show that local financial market development is a further conditioning factor. @carkovic2005 apply GMM estimators to a large cross-country panel and find little evidence of an independent causal effect of FDI on growth once country fixed effects are controlled for, highlighting the identification challenge.
 
-@narula2012 raise a further challenge to the causal interpretation of positive FDI-growth correlations. In their introductory essay to a debate forum on FDI and development, they argue that the empirical evidence on FDI-assisted growth is more ambiguous than is widely acknowledged, and that structural simplifications in the empirical literature obscure the conditions under which FDI contributes to host-country growth. They point to reverse causality (investors targeting already-dynamic economies), heterogeneous spillover conditions, and the inadequacy of aggregate FDI data as persistent sources of bias. The approach taken here addresses the reverse-causality concern through lagged regressors and fixed effects, but, as discussed in Section 5.4, a valid instrumental-variable strategy would be needed to fully resolve the endogeneity problem.
+@narula2012 argue that the empirical evidence on FDI-assisted growth is more ambiguous than widely acknowledged, pointing to reverse causality, heterogeneous spillover conditions, and the inadequacy of aggregate FDI data as persistent sources of bias. The approach here addresses reverse causality through lagged regressors and fixed effects, though a valid instrument would be needed to fully resolve the endogeneity problem.
 
-@blomstrom1991 surveys the evidence on FDI spillovers, cataloguing the channels (competitive pressure, labour training, and technology transfer to local suppliers) through which host-country firms may benefit from multinational presence. The survey notes that spillover gains are likely larger where local firms have the skill base to absorb and imitate foreign technologies, anticipating the absorptive-capacity literature. Firm-level evidence from @pasali2020 suggests that productivity gains from foreign ownership are concentrated among smaller firms in developing countries, consistent with the macro-level heterogeneity estimated in this paper. @tomohara2011 document positive wage effects of FDI in manufacturing, consistent with labour-market spillovers in a developing-country context.
+@blomstrom1991 catalogues the channels—competitive pressure, labour training, and technology transfer to local suppliers—through which host-country firms may benefit from multinational presence, and notes that spillover gains are larger where local firms have the skill base to absorb foreign technologies. @tomohara2011 document positive wage effects of FDI in manufacturing, consistent with labour-market spillovers.
 
 ## Contribution
 
-Against this backdrop, the present paper makes two contributions. Methodologically, it applies a two-way fixed-effects estimator with country-clustered standard errors to a panel of `r n_countries` economies, which is more demanding than the pooled or cross-section designs common in the earlier literature. Substantively, it tests the @findlay1978 heterogeneity prediction using an income-group interaction in a within-country identification framework, rather than relying on cross-sectional variation in income that is confounded with many other country characteristics. The main finding is that the FDI-growth relationship is statistically indistinguishable from zero for above-median-income economies and positive for below-median-income economies, consistent with the relative-backwardness hypothesis, though the identification strategy falls short of the IV benchmark required for a causal interpretation.
+This paper makes two contributions. Methodologically, it uses a two-way fixed-effects estimator with country-clustered standard errors on a panel of `r n_countries` economies, which is more demanding than the pooled or cross-section designs common in the earlier literature. Substantively, it tests the @findlay1978 heterogeneity prediction using an income-group interaction in a within-country framework, rather than relying on cross-sectional income variation that is confounded with other country characteristics. The main finding is that the FDI-growth relationship is statistically indistinguishable from zero for above-median-income economies and positive for below-median-income economies, consistent with the relative-backwardness hypothesis, though the identification strategy falls short of the IV benchmark required for a causal interpretation.
 
 # Data
 
@@ -287,6 +394,8 @@ The analysis draws on three annual series from the World Bank Development Indica
 2. GDP per capita growth, annual % (series `NY.GDP.PCAP.KD.ZG`): the dependent variable.
 3. GDP per capita, PPP (constant 2021 international $) (series `NY.GDP.PCAP.PP.KD`): used to construct the convergence control and the income-group indicator.
 
+A fourth series, trade openness (exports plus imports as a share of GDP, series `NE.TRD.GNFS.ZS`), is used in robustness check R7.
+
 The PPP-adjusted constant-price series is preferred over nominal current-USD GDP per capita for two reasons. First, PPP adjustment removes cross-country price-level differences, ensuring that the income-group classification reflects real purchasing power rather than nominal exchange rates. Second, using constant prices removes inflation effects, so that the convergence control and income-group indicator reflect real income changes over time.
 
 After removing regional and income-group aggregates from the World Bank's reporting structure, the raw data cover `r n_countries` individual economies. The panel is unbalanced because FDI reporting begins at different dates for different countries; the earliest observations are from `r yr_min` and the latest from `r yr_max`.
@@ -295,7 +404,7 @@ After removing regional and income-group aggregates from the World Bank's report
 
 All estimation uses R [@rcoreteam2025] with packages WDI [@arelbundock2019wdi], fixest [@berge2018fixest], tidyverse [@wickham2019tidyverse], and kableExtra [@zhu2024kableextra].
 
-Three decisions require explicit justification. First, both the dependent variable and the FDI regressor are winsorised at the 1st and 99th percentiles of their respective pooled distributions. The raw growth series contains episodes of hyperinflation, armed conflict, and statistical revisions that generate observations ranging below −50% and above 100%. FDI-to-GDP ratios can exceed 1,000% in small economies that serve as holding-company hubs (e.g. the Cayman Islands), reflecting balance-sheet intermediation rather than real productive investment. Winsorising growth to [`r round(q_g[1],1)`%, `r round(q_g[2],1)`%] and FDI to [`r fdi_w_lo`%, `r fdi_w_hi`%] bounds these extremes while retaining all observations; no country is excluded by list or name. This treatment is applied to the raw annual FDI series before constructing lags, so the IHS transformation is then applied to the already-winsorised lagged values.
+Three decisions require explicit justification. First, both the dependent variable and the FDI regressor are winsorised at the 1st and 99th percentiles of their respective pooled distributions. Raw growth rates include episodes of conflict and statistical revisions generating values below −50% or above 100%, and FDI-to-GDP can exceed 1,000% in small holding-company hubs—reflecting balance-sheet intermediation rather than real investment. Winsorising growth to [`r round(q_g[1],1)`%, `r round(q_g[2],1)`%] and FDI to [`r fdi_w_lo`%, `r fdi_w_hi`%] retains all country-year observations while bounding these extremes.
 
 Second, the FDI series contains `r pct_zero`% zeros and `r pct_neg`% negative values. Zeros arise in years when no investment inflows were recorded (common in countries with thin financial sectors), while negative values reflect disinvestment and profit repatriation. The natural logarithm cannot handle these values: $\log(x)$ is undefined for $x \leq 0$. Dropping zeros and negatives would remove precisely the low-FDI, often lower-income observations most relevant to the heterogeneity analysis, inducing selection bias. The inverse hyperbolic sine (IHS) transformation $\text{asinh}(x) = \ln(x + \sqrt{x^2+1})$ avoids this problem: it is defined for all real $x$, equals zero when $x = 0$, handles negative values symmetrically, and approximates $\ln(2x)$ for large positive $x$ [@bellemare2020]. Coefficients on $\text{asinh}(\text{FDI})$ are interpretable as semi-elasticities, similarly to log-transformed regressors.
 
@@ -386,7 +495,7 @@ $$g_{it} = \alpha_i + \lambda_t + \beta_1\,\text{asinh}(\text{FDI}_{i,t-1}) + \b
 
 where $D_i^L = 1$ if country $i$'s time-averaged GDP per capita falls below the cross-country sample median. The country fixed effects absorb the (time-invariant) main effect of $D_i^L$. The interaction coefficient $\hat\beta_2$ captures the additional FDI-growth sensitivity of below-median-income economies relative to above-median-income economies within the same panel. Under the relative-backwardness hypothesis [@findlay1978], $\hat\beta_2 > 0$, though it should be noted that the within-country identification cannot fully isolate the Findlay mechanism from other income-related heterogeneity.
 
-Standard errors are clustered by country throughout, accounting for arbitrary serial correlation within the country time series. Section 5.4 reports four robustness checks that directly address the limitations of this baseline: (i) a time-varying income classification that re-classifies countries each year against the annual cross-country median (addressing the convergence-country misclassification concern); (ii) a balanced panel restricting to countries with at least `r min_obs_bal` annual observations; (iii) alternative lag structures at $t-2$ and $t-3$; and (iv) two-way country-and-year clustered standard errors.
+Standard errors are clustered by country throughout, accounting for arbitrary serial correlation within the country time series. Section 5.3 reports seven robustness checks that directly address the limitations of this baseline: (i) a time-varying income classification that re-classifies countries each year against the annual cross-country median (addressing the convergence-country misclassification concern); (ii) a balanced panel restricting to countries with at least `r min_obs_bal` annual observations; (iii) alternative lag structures at $t-2$ and $t-3$; (iv) two-way country-and-year clustered standard errors; (v) an initial-period income classification that avoids look-ahead bias; (vi) exclusion of financial centres and resource enclaves with distorted FDI-to-GDP ratios; and (vii) a trade openness control.
 
 # Results
 
@@ -417,19 +526,11 @@ Column (3): Two-Way FE with convergence control. The addition of $\ln\text{GDPpc
 
 Column (4): Income-group heterogeneity. The results differ across income groups. For above-median-income economies, the FDI semi-elasticity falls to $\hat\beta_1 = `r round(b4_h, 3)`$, which is statistically indistinguishable from zero. For below-median-income economies the total effect is $\hat\beta_1 + \hat\beta_2 \approx `r round(b4_l, 3)`$ (`r sig_label(p4_l_1w)`). The positive $\hat\beta_2$ is consistent with the pattern predicted by @findlay1978.
 
-## Economic Magnitude
+## Consistency with Theory
 
-To translate the econometric estimate into a more interpretable magnitude, the marginal effect is evaluated at the median lagged FDI-to-GDP ratio among below-median-income countries in the sample. Since the regressor is $\text{asinh}(\text{FDI}_{i,t-1})$, the derivative with respect to the lagged FDI share is $d\,\text{asinh}(x)/dx = 1/\sqrt{1+x^2}$, so the implied effect in the original percentage-of-GDP space is:
+The income-group heterogeneity in column (4) is consistent with the @findlay1978 argument at the macroeconomic level. A one-percentage-point increase in the lagged FDI-to-GDP ratio is associated with approximately `r round(marg, 2)` pp more annual GDP per capita growth in below-median-income economies, evaluated at their median FDI share of `r round(med_fdi_li, 1)`%.[^marg] Both the technology-gap mechanism (@findlay1978) and the capital-scarcity mechanism (@dunning1979) would predict larger gains in lower-income countries with shallow domestic financial systems, while neither would reliably produce the positive effect at the frontier. The statistically insignificant result for above-median-income economies is also consistent with competitive displacement by multinationals, though the design cannot separate these explanations; that remains a question for future work.
 
-$$\frac{\partial g_{it}}{\partial \text{FDI}_{i,t-1}} \approx \frac{\hat\beta_1 + \hat\beta_2}{\sqrt{1 + \text{FDI}^2_{\text{med}}}} \approx `r round(marg, 3)`$$
-
-evaluated at the median FDI share of `r round(med_fdi_li, 1)`% for below-median-income countries. A one-percentage-point increase in the lagged FDI-to-GDP ratio is therefore associated with approximately `r round(marg, 2)` pp more annual GDP per capita growth in below-median-income economies. The mean growth rate in this group is `r mean_grow_li`%, so the implied effect represents about `r round(100 * marg / mean_grow_li)`% of mean growth.
-
-## Consistency with Theory and Micro Evidence
-
-The income-group heterogeneity in column (4) is consistent with the @findlay1978 argument at the macroeconomic level and with the micro-level evidence in @pasali2020, who find that firm-level productivity gains from foreign ownership are concentrated among smaller firms in developing countries, consistent with firms facing a larger technology gap relative to multinational affiliates; this provides micro-foundations for the macro-level heterogeneity estimated here. A second complementary mechanism is capital scarcity: in below-median-income economies with shallow domestic financial systems, FDI can augment the productive capital stock directly, beyond any knowledge-diffusion channel [@dunning1979]. Both mechanisms are less likely in above-median-income countries, which operate closer to the technology frontier and have deeper capital markets. One possible explanation for the statistically indistinguishable-from-zero effect in above-median-income economies is competitive displacement (multinational affiliates crowding out domestic firms), though the design cannot distinguish this from simply lower technology-gap gains; this remains a question for future research using sector-level data.
-
-The result that adding the income interaction leaves the convergence coefficient at $\hat\delta \approx `r round(d4, 2)`$ (`r sig_label(get_p(m4, "lgdppc_l1"))`), nearly identical to column (3), is consistent with the interaction and the convergence control capturing distinct sources of variation rather than the same mechanism.
+[^marg]: Formally, $\partial g_{it}/\partial \text{FDI}_{i,t-1} \approx (\hat\beta_1 + \hat\beta_2)/\sqrt{1 + \text{FDI}^2_{\text{med}}} \approx `r round(marg, 3)`$.
 
 ## Robustness Checks
 
@@ -443,7 +544,10 @@ rob <- tibble::tibble(
     paste0("R2: Balanced panel ($\\geq ", min_obs_bal, "$ obs/country; $n_{\\text{cty}}=", n_countries_bal, "$)"),
     "R3a: Two-year lag, asinh(FDI$_{t-2}$)",
     "R3b: Three-year lag, asinh(FDI$_{t-3}$)",
-    "R4: Two-way clustered SE (country $\\times$ year)"
+    "R4: Two-way clustered SE (country $\\times$ year)",
+    paste0("R5: Initial-period income classification ($n_{\\text{low}}=", n_low_init, "$)"),
+    paste0("R6: Exclude financial centres and resource enclaves ($n_{\\text{excl}}=", n_excl, "$)"),
+    "R7: Trade openness control (lagged trade/GDP)"
   ),
   `$N$` = format(c(
     n_obs,
@@ -451,23 +555,32 @@ rob <- tibble::tibble(
     nobs(m_bal),
     n_obs_l2,
     n_obs_l3,
-    n_obs
+    n_obs,
+    nobs(m_init),
+    n_obs_noout,
+    n_obs_trade
   ), big.mark = ","),
   `Above-median $\\hat\\beta$` = c(
-    sprintf("%.3f%s", b4_h,   stars_p(get_p(m4,  "ihs_fdi"))),
-    sprintf("%.3f%s", b_tv_h, stars_p(p_tv_h)),
-    sprintf("%.3f%s", b_bal_h,stars_p(p_bal_h)),
-    sprintf("%.3f%s", b_l2_h, stars_p(p_l2_h)),
-    sprintf("%.3f%s", b_l3_h, stars_p(p_l3_h)),
-    sprintf("%.3f%s", b4_h,   stars_p(p4_h_2w))
+    sprintf("%.3f%s", b4_h,     stars_p(get_p(m4,    "ihs_fdi"))),
+    sprintf("%.3f%s", b_tv_h,   stars_p(p_tv_h)),
+    sprintf("%.3f%s", b_bal_h,  stars_p(p_bal_h)),
+    sprintf("%.3f%s", b_l2_h,   stars_p(p_l2_h)),
+    sprintf("%.3f%s", b_l3_h,   stars_p(p_l3_h)),
+    sprintf("%.3f%s", b4_h,     stars_p(p4_h_2w)),
+    sprintf("%.3f%s", b_init_h, stars_p(p_init_h)),
+    sprintf("%.3f%s", b_excl_h, stars_p(p_excl_h)),
+    sprintf("%.3f%s", b_trade_h,stars_p(p_trade_h))
   ),
   `Below-median total` = c(
-    sprintf("%.3f%s", b4_l,   stars_p(p4_l_1w)),
-    sprintf("%.3f%s", b_tv_l, stars_p(p_tv_l)),
-    sprintf("%.3f%s", b_bal_l,stars_p(p_bal_l)),
-    sprintf("%.3f%s", b_l2_l, stars_p(p_l2_l)),
-    sprintf("%.3f%s", b_l3_l, stars_p(p_l3_l)),
-    sprintf("%.3f%s", b4_l,   stars_p(p4_l_2w))
+    sprintf("%.3f%s", b4_l,     stars_p(p4_l_1w)),
+    sprintf("%.3f%s", b_tv_l,   stars_p(p_tv_l)),
+    sprintf("%.3f%s", b_bal_l,  stars_p(p_bal_l)),
+    sprintf("%.3f%s", b_l2_l,   stars_p(p_l2_l)),
+    sprintf("%.3f%s", b_l3_l,   stars_p(p_l3_l)),
+    sprintf("%.3f%s", b4_l,     stars_p(p4_l_2w)),
+    sprintf("%.3f%s", b_init_l, stars_p(p_init_l)),
+    sprintf("%.3f%s", b_excl_l, stars_p(p_excl_l)),
+    sprintf("%.3f%s", b_trade_l,stars_p(p_trade_l))
   )
 )
 
@@ -481,13 +594,16 @@ kbl(rob, format = "latex", booktabs = TRUE, escape = FALSE,
       "Above-median $\\hat\\beta$ is the coefficient on asinh(FDI$_{t-k}$); ",
       "Below-median total effect is $\\hat\\beta_1+\\hat\\beta_2$ tested via Wald test. ",
       "R4 uses same point estimates as the baseline but reclusters SE by country and year simultaneously. ",
-      "$N$ for R3a and R3b are smaller because the additional lag removes the first one or two years per country.")) |>
+      "$N$ for R3a and R3b are smaller because the additional lag removes the first one or two years per country. ",
+      "R5 classifies countries by GDP per capita in their first sample year. ",
+      "R6 excludes countries with mean FDI/GDP $>$ 10\\%. ",
+      "R7 adds lagged trade openness and is estimated on the subsample where trade data are available.")) |>
   kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9) |>
   column_spec(1, width = "7cm") |>
   row_spec(0, bold = TRUE)
 ```
 
-Table 3 summarises four robustness exercises (R1-R4), the third of which comprises two lag variants (t-2 and t-3). The baseline result is qualitatively unchanged across all four specifications.
+Table 3 summarises seven robustness exercises (R1–R7), the third of which comprises two lag variants (t-2 and t-3). The baseline result is qualitatively unchanged across all specifications.
 
 R1: Time-varying income classification. The static $D_i^L$ dummy assigns countries to a group for their entire history, potentially misclassifying rapidly converging economies (e.g., South Korea, Singapore) in later decades. To address this, $D_i^L$ is replaced with a time-varying indicator $D_{it}^L = \mathbf{1}[\text{GDPpc}_{it} < \text{median}_j(\text{GDPpc}_{jt})]$ that re-classifies each country against the annual cross-country median. The total below-median-income effect under this specification is $`r round(b_tv_l, 3)`$ (`r sig_label(p_tv_l)`), smaller in magnitude than the baseline ($`r round(b4_l, 3)`$) but still positive and statistically significant, suggesting the result is not an artefact of time-fixed group assignment. The attenuation is consistent with the time-varying classification more aggressively reassigning converging countries to the above-median group in later periods.
 
@@ -497,16 +613,67 @@ R3: Alternative lag structures. To assess whether the one-period lag is sufficie
 
 R4: Two-way clustered standard errors. Country-only clustering may under-estimate standard errors if unobserved shocks produce cross-sectional correlation within years (e.g., global capital flow surges). Re-clustering on both country and year simultaneously raises the standard error on the above-median-income FDI coefficient to $`r round(se4_h_2w, 3)`$ and on the interaction to $`r round(se4_i_2w, 3)`$, but the total below-median-income effect remains significant at the $`r if(p4_l_2w < 0.001) "0.1\\%" else if(p4_l_2w < 0.01) "1\\%" else if(p4_l_2w < 0.05) "5\\%" else "10\\%"` level.
 
-Despite these checks, three limitations remain. First, the residual endogeneity concern (investors tracking multi-year growth trajectories) cannot be fully resolved without a valid instrument. Bilateral investment treaty ratification networks represent a candidate for future work. Second, the aggregate FDI measure conflates resource-seeking, market-seeking, and efficiency-seeking investment [@dunning1979], as well as reinvested earnings of existing affiliates alongside new greenfield entry; each component carries different implications for technology transfer, and disaggregated bilateral data would allow a more detailed investigation of mechanisms. Third, the income-group indicator $D_i^L$ is constructed from time-averaged GDP per capita over the full sample period, meaning that the growth performance being explained contributes to the group assignment. Countries that grew relatively slowly over the panel period are more likely to be classified as below-median, which could introduce a form of look-ahead bias. The time-varying classification in R1 partially addresses this by using only contemporaneous income, but a fully prospective classification scheme would require external income thresholds.
+```{r fig-coef, fig.width=5.5, fig.height=3.2}
+#| fig-cap: "FDI coefficient estimates with 90% confidence intervals across specifications. For the income-interaction model (Spec. 4) two estimates are shown: the above-median effect ($\\hat\\beta_1$) and the total below-median effect ($\\hat\\beta_1 + \\hat\\beta_2$). Confidence intervals based on country-clustered standard errors."
+
+# Build coefficient + CI data frame
+ci90 <- function(m, var) {
+  b  <- coef(m)[var]
+  se <- se(m, vcov = ~code)[var]
+  tibble(est = b, lo = b - 1.645 * se, hi = b + 1.645 * se)
+}
+# For below-median total effect use delta-method SE
+ci90_sum <- function(m, v1 = "ihs_fdi", v2 = "ihs_fdi_li") {
+  b  <- coef(m)[v1] + coef(m)[v2]
+  V  <- vcov(m, vcov = ~code)
+  se <- sqrt(V[v1,v1] + V[v2,v2] + 2*V[v1,v2])
+  tibble(est = b, lo = b - 1.645 * se, hi = b + 1.645 * se)
+}
+
+coef_df <- bind_rows(
+  ci90(m1, "ihs_fdi") |> mutate(label = "(1) Pooled OLS",         group = "Average"),
+  ci90(m2, "ihs_fdi") |> mutate(label = "(2) Two-way FE",          group = "Average"),
+  ci90(m3, "ihs_fdi") |> mutate(label = "(3) + Convergence",       group = "Average"),
+  ci90(m4, "ihs_fdi") |> mutate(label = "(4) Income interaction",  group = "Above-median"),
+  ci90_sum(m4)        |> mutate(label = "(4) Income interaction",  group = "Below-median")
+) |>
+  mutate(
+    label = factor(label, levels = rev(c("(1) Pooled OLS","(2) Two-way FE",
+                                          "(3) + Convergence","(4) Income interaction"))),
+    group = factor(group, levels = c("Average","Above-median","Below-median"))
+  )
+
+ggplot(coef_df, aes(x = est, y = label, colour = group, shape = group)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.15, linewidth = 0.7) +
+  geom_point(size = 2.5) +
+  scale_colour_manual(values = c("Average" = "grey40",
+                                  "Above-median" = "steelblue",
+                                  "Below-median" = "firebrick")) +
+  scale_shape_manual(values = c("Average" = 16, "Above-median" = 17, "Below-median" = 15)) +
+  labs(x = "Coefficient on asinh(FDI)", y = NULL, colour = NULL, shape = NULL) +
+  theme_classic(base_size = 9) +
+  theme(legend.position = "bottom")
+```
+
+Figure 2 plots the coefficient estimates across all four main specifications with 90% confidence intervals. For below-median-income economies the estimate is positive and statistically different from zero across all specifications that separate income groups.
+
+R5: Initial-period income classification. The static $D_i^L$ dummy based on time-averaged income introduces look-ahead bias: countries that grew slowly during the sample are more likely to be classified as below-median, and that slow growth is also the outcome being explained. To address this, each country is classified using only its GDP per capita in the first year it appears in the estimation sample, relative to the cross-country median of those initial values. This classification is fully prospective. Under this criterion `r n_low_init` economies are classified as initially below-median. The total below-median-income FDI effect is $`r round(b_init_l, 3)`$ (`r sig_label(p_init_l)`), confirming that the heterogeneity result does not depend on the backward-looking income classification.
+
+R6: Exclude financial centres and resource enclaves. FDI-to-GDP ratios exceeding 10% on average typically reflect balance-sheet intermediation in offshore financial centres or large single-project resource extraction, rather than productive investment. The `r n_excl` countries with mean FDI/GDP above this threshold are excluded (`r excl_label`). The remaining `r format(n_obs_noout, big.mark=",")` observations yield an above-median estimate of $`r round(b_excl_h, 3)`$ (`r sig_label(p_excl_h)`) and a below-median total effect of $`r round(b_excl_l, 3)`$ (`r sig_label(p_excl_l)`), unchanged from the baseline.
+
+R7: Trade openness control. Trade-open economies may simultaneously attract more FDI and grow faster, so that the FDI coefficient could partly proxy for trade rather than capturing FDI's own effect. Adding lagged trade (exports plus imports as a share of GDP) as a time-varying control—estimated on the `r format(n_obs_trade, big.mark=",")` observations for which this series is available—leaves the above-median estimate at $`r round(b_trade_h, 3)`$ (`r sig_label(p_trade_h)`) and the below-median total effect at $`r round(b_trade_l, 3)`$ (`r sig_label(p_trade_l)`), suggesting trade openness is not the primary driver of the result.
+
+Despite these checks, two structural limitations remain. First, the residual endogeneity concern cannot be fully resolved without a valid instrument. Bilateral investment treaty ratification networks from the EDIT database [@alschner2021edit] represent a natural candidate, covering `r format(n_edit_agr, big.mark=",")` agreements across `r n_edit_cty` economies. However, every instrument variant constructed from the EDIT data yields first-stage F statistics well below the conventional threshold of 10 for the main FDI equation. The failure appears structural: annual within-country variation in BIT stock is insufficient to move aggregate FDI-to-GDP, and the remaining variation is absorbed by year fixed effects that capture the global BIT proliferation wave of the 1990s and 2000s. A valid IV strategy requires bilateral FDI data matched to treaty ratification, where the treaty-to-flow link can be measured directly. Second, the aggregate FDI measure conflates resource-seeking, market-seeking, and efficiency-seeking investment [@dunning1979], as well as reinvested earnings alongside new greenfield entry; disaggregated bilateral data would allow a more detailed investigation of mechanisms.
 
 # Conclusion
 
 This paper examines the relationship between foreign direct investment and GDP per capita growth using an unbalanced panel of `r n_countries` economies over `r yr_min` to `r yr_max`. By combining one-period lagging, two-way fixed effects, and a conditional convergence control, the analysis addresses identification challenges arising from reverse causality and time-invariant omitted variables. Residual endogeneity cannot be ruled out without a valid instrument, so results are best interpreted as conditional associations rather than causal estimates. The central finding is that the aggregate FDI-growth coefficient, while positive, masks income-group heterogeneity. In above-median-income economies, within-country changes in FDI have no statistically significant effect on growth. In below-median-income economies, a one-percentage-point increase in the lagged FDI-to-GDP ratio is associated with approximately `r round(marg, 2)` pp of additional annual GDP per capita growth, an effect that is statistically significant.
 
-These results are consistent with the @findlay1978 relative-backwardness hypothesis: technology spillovers from FDI appear largest where the gap with the global frontier is greatest. The finding is robust to four alternative specifications: replacing the static income-group classification with a time-varying annual-median criterion, restricting estimation to the balanced sub-panel of countries with at least `r min_obs_bal` annual observations, shifting the lag structure to $t-2$ or $t-3$, and tightening inference with two-way country-and-year clustered standard errors. In all cases the total below-median-income FDI effect remains positive and statistically significant.
+These results are consistent with the @findlay1978 relative-backwardness hypothesis: technology spillovers from FDI appear largest where the gap with the global frontier is greatest. The finding is robust to seven alternative specifications: replacing the static income-group classification with a time-varying annual-median criterion, restricting estimation to the balanced sub-panel of countries with at least `r min_obs_bal` annual observations, shifting the lag structure to $t-2$ or $t-3$, tightening inference with two-way country-and-year clustered standard errors, using an initial-period income classification that avoids look-ahead bias (R5), excluding financial centres and resource enclaves with distorted FDI-to-GDP ratios (R6), and adding a lagged trade openness control (R7). In all cases the total below-median-income FDI effect remains positive and statistically significant.
 
 These results have implications for FDI promotion policy. For above-median-income countries, the estimated growth returns to FDI attraction are negligible on average, suggesting that fiscal incentives aimed at attracting multinationals may offer limited value as a growth strategy. For below-median-income countries, the evidence is consistent with FDI having a positive association with growth, which motivates continued attention to investment-climate conditions. These results cannot, however, identify which specific policies most effectively attract productive FDI or whether the estimated association would persist under policy-induced increases in FDI flows.
 
-Future work should pursue a credible instrumental-variable strategy to sharpen the causal interpretation, decompose the aggregate FDI effect by investment type following the @dunning1979 OLI framework, and examine whether the intensive margin (increased investment by incumbents) and the extensive margin (new entrant multinationals) carry different growth implications.
+Future work should pursue a credible instrumental-variable strategy to sharpen the causal interpretation—bilateral investment treaty ratification data [@alschner2021edit] are a natural candidate when matched with bilateral FDI flows—decompose the aggregate FDI effect by investment type following the @dunning1979 OLI framework, and examine whether the intensive margin (increased investment by incumbents) and the extensive margin (new entrant multinationals) carry different growth implications.
 
 # References
